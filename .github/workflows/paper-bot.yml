@@ -32,6 +32,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Test simulation logic
+        run: python -m unittest test_simulations.py
+
+      - name: Restore simulation history
+        uses: actions/cache/restore@v4
+        with:
+          path: paper_bot_state.json
+          key: paper-bot-state-${{ github.run_id }}
+          restore-keys: |
+            paper-bot-state-
+
       - name: Run PAPER bot
         env:
           ALPACA_PAPER_KEY: ${{ secrets.ALPACA_PAPER_KEY }}
@@ -46,6 +57,13 @@ jobs:
           MIN_CONFIDENCE_SCORE: '75'
           MAX_DAILY_LOSS_PCT: '2'
         run: python bot.py
+
+      - name: Save simulation history
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: paper_bot_state.json
+          key: paper-bot-state-${{ github.run_id }}
 
       - name: Save scan results
         if: always()
