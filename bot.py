@@ -304,7 +304,14 @@ def main():
             latest_by_symbol[symbol.replace("/", "")] = result
             qualified = (result["score"] >= min_score and result["trigger"] and
                          result["trend1"] and result["trend4"] and result["macd_ok"])
-            result.update({"symbol": symbol, "qualified": bool(qualified)})
+            rejection_reasons = []
+            if result["score"] < min_score:
+                rejection_reasons.append(f"score {result['score']}<{min_score}")
+            for flag in ("trigger", "trend1", "trend4", "macd_ok"):
+                if not result[flag]:
+                    rejection_reasons.append(flag)
+            result.update({"symbol": symbol, "qualified": bool(qualified),
+                           "rejection_reasons": rejection_reasons})
             results.append(result)
             LOG.info("%s score=%d RSI=%.1f qualified=%s bar=%s", symbol,
                      result["score"], result["rsi"], qualified, result["bar"])
@@ -377,6 +384,14 @@ def main():
             notify(f"BUY SUBMISSION UNCERTAIN {item['symbol']}: {type(exc).__name__}; "
                    "inspect Alpaca before retrying")
             pending.add(normalized)
+    # Report near misses so zero-candidate scans are actionable.
+    near_misses = sorted((r for r in results if "error" not in r and not r["qualified"]),
+                         key=lambda r: r["score"], reverse=True)[:5]
+    if not candidates:
+        summary = "; ".join(
+            f"{r['symbol']} {r['score']}/100: {', '.join(r['rejection_reasons'])}"
+            for r in near_misses)
+        notify("NO QUALIFIED SETUPS | Top near misses: " + (summary or "none"))
     report = {"generated_utc": datetime.now(timezone.utc).isoformat(),
               "paper_orders_enabled": execute, "daily_entries_blocked": daily_block,
               "equity": equity, "markets": len(symbols), "errors": errors, "results": results}
