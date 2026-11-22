@@ -1,5 +1,6 @@
 import unittest
 from bot import update_simulations, performance
+from backtest import backtest
 
 class SimulationTests(unittest.TestCase):
     def test_no_same_bar_outcome(self):
@@ -9,6 +10,9 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(state["simulations"][0]["status"], "open")
         update_simulations(state, {"BTCUSD":{"bar":"2026-11-22T11:00:00Z","price":111}})
         self.assertEqual(state["simulations"][0]["status"], "closed")
+
+    def test_backtest_insufficient_history(self):
+        self.assertEqual(backtest([])["trades"], 0)
 
     def test_position_size_requires_history(self):
         self.assertEqual(performance({})["paper_allocation_cap"], 10)
