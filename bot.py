@@ -277,6 +277,13 @@ def update_simulations(state, latest, max_bars=12):
         sim["last_evaluated_bar"] = market["bar"]
         sim["bars_held"] = sim.get("bars_held", 0) + 1
         price = market["price"]
+        # Close-based trailing stop, ratchets upward only after favorable movement.
+        sim["peak_price"] = max(sim.get("peak_price", sim["entry_price"]), price)
+        initial_risk = sim.get("initial_risk", sim["entry_price"] - sim["stop"])
+        if initial_risk > 0 and sim["peak_price"] >= sim["entry_price"] + initial_risk:
+            sim["stop"] = max(sim["stop"], sim["entry_price"])
+        if initial_risk > 0 and sim["peak_price"] >= sim["entry_price"] + 2 * initial_risk:
+            sim["stop"] = max(sim["stop"], sim["peak_price"] - initial_risk)
         if price <= sim["stop"] or price >= sim["target"] or sim["bars_held"] >= max_bars:
             # Conservative close-based evaluation; actual intrabar stops may differ.
             sim["exit_price"] = price
@@ -382,7 +389,8 @@ def main():
             "symbol": symbol, "entry_bar": item["bar"], "entry_price": item["price"],
             "stop": item["price"] - distance, "target": item["price"] + 2 * distance,
             "status": "open", "bars_held": 0, "score": item["score"],
-            "notional_usd": stats["paper_allocation_cap"]})
+            "notional_usd": stats["paper_allocation_cap"],
+            "initial_risk": distance, "peak_price": item["price"]})
     state["simulations"] = state["simulations"][-500:]
     notify(f"SHADOW TEST | closed={stats['closed']} recent_win_rate="
            f"{stats['win_rate']:.0%} avg_return={stats['avg_return_pct']:.3f}% "
