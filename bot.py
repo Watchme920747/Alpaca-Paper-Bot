@@ -1,163 +1,266 @@
-"""Educational Alpaca PAPER-only crypto trading bot. No live trading endpoints."""
-import os, sys, math, time, requests
+
+"""Alpaca crypto signal scanner. NO ORDER EXECUTION; designed for paper testing.
+
+Requires ALPACA_PAPER_KEY and ALPACA_PAPER_SECRET in environment.
+Optional TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
+This scanner NEVER sends trade orders, regardless of ENABLE_ORDERS.
+"""
+import os
+import sys
+import math
+import json
+import requests
 from datetime import datetime, timedelta, timezone
 
 KEY = os.environ['ALPACA_PAPER_KEY']
 SECRET = os.environ['ALPACA_PAPER_SECRET']
-BASE = 'https://paper-api.alpaca.markets'
-DATA = 'https://data.alpaca.markets'
 HEAD = {'APCA-API-KEY-ID': KEY, 'APCA-API-SECRET-KEY': SECRET}
-SYMBOLS = ['BTC/USD', 'ETH/USD', 'SOL/USD']
-RISK = 0.01
-MAX_ALLOCATION = 0.25
-DAILY_LOSS_LIMIT = 0.02
-ENABLE_ORDERS = os.getenv('ENABLE_ORDERS', 'false').lower() == 'true'
+PAPER_API = 'https://paper-api.alpaca.markets'
+DATA_API = 'https://data.alpaca.markets'
+CORE_SYMBOLS = ('BTC/USD', 'ETH/USD', 'SOL/USD')
+MAX_MARKETS = max(3, min(40, int(os.getenv('MAX_MARKETS', '20'))))
+SCAN_ALL_CRYPTO = os.getenv('SCAN_ALL_CRYPTO', 'true').lower() == 'true'
+# No live or paper orders: this scanner only produces candidate signals.
+ENABLE_ORDERS = False
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 CHAT = os.getenv('TELEGRAM_CHAT_ID', '')
+MAX_TRADE_USD = min(100.0, max(0.0, float(os.getenv('MAX_TRADE_USD', '100'))))
+MIN_SCORE = max(0, min(100, int(os.getenv('MIN_CONFIDENCE_SCORE', '70'))))
+DAILY_LOSS_PCT = min(2.0, max(0.0, float(os.getenv('MAX_DAILY_LOSS_PCT', '2'))))
+# Limit risk even at the highest score; not a probability-of-success estimate.
+RISK_TIERS = ((95, .01, 100), (90, .0075, 75), (80, .005, 50), (70, .0025, 25))
+RUN_RESULTS = []
 
 
-def notify(msg):
-    print(msg, flush=True)
+def notify(message):
+    print(message, flush=True)
     if TOKEN and CHAT:
         try:
-            requests.post(f'https://api.telegram.org/bot{TOKEN}/sendMessage',
-                          json={'chat_id': CHAT, 'text': msg[:4000]}, timeout=12).raise_for_status()
-        except Exception as ex:
-            print(f'Telegram failed: {ex}', file=sys.stderr)
+            r = requests.post(f'https://api.telegram.org/bot{TOKEN}/sendMessage',
+                              json={'chat_id': CHAT, 'text': message[:4000]}, timeout=12)
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            print(f'Telegram notification failed: {exc}', file=sys.stderr)
 
 
-def api(method, path, *, params=None, payload=None, data=False):
-    root = DATA if data else BASE
-    r = requests.request(method, root + path, headers=HEAD, params=params, json=payload, timeout=25)
+def api(root, path, params=None):
+    r = requests.get(root + path, headers=HEAD, params=params, timeout=25)
     r.raise_for_status()
     return r.json()
 
 
+def discover_markets():
+    """Discover Alpaca-tradeable crypto pairs, rather than assuming every token is supported."""
+    if not SCAN_ALL_CRYPTO:
+        return list(CORE_SYMBOLS)
+    assets = api(PAPER_API, '/v2/assets', {'status': 'active', 'asset_class': 'crypto'})
+    candidates = set(CORE_SYMBOLS)
+    for asset in assets:
+        if not asset.get('tradable', False):
+            continue
+        symbol = asset.get('symbol', '')
+        if '/' not in symbol or not symbol.endswith('/USD'):
+            continue
+        candidates.add(symbol)
+    # The first scan prioritizes the three core symbols; cap to limit free CI/API use.
+    return list(CORE_SYMBOLS) + sorted(candidates - set(CORE_SYMBOLS))[:MAX_MARKETS-3]
+
+
 def ema(values, span):
-    a = 2 / (span + 1)
     result = values[0]
+    alpha = 2 / (span + 1)
     out = []
-    for v in values:
-        result = a*v + (1-a)*result
+    for value in values:
+        result = alpha * value + (1 - alpha) * result
         out.append(result)
     return out
 
 
-def bars(symbol):
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=8)
-    rows = api('GET', '/v1beta3/crypto/us/bars', data=True, params={
-        'symbols': symbol, 'timeframe': '1Hour',
+def get_bars(symbol, timeframe, hours, min_count):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=hours)
+    # Fetch one symbol at a time. Crypto feeds may contain gaps in hourly bars.
+    response = api(DATA_API, '/v1beta3/crypto/us/bars', {
+        'symbols': symbol, 'timeframe': timeframe,
         'start': start.isoformat().replace('+00:00', 'Z'),
-        'end': end.isoformat().replace('+00:00', 'Z'),
+        'end': now.isoformat().replace('+00:00', 'Z'),
         'limit': 1000,
-    })['bars'].get(symbol, [])
-    # Ignore any candle still forming. UTC timestamp denotes bar start.
+        'sort': 'asc',
+    })
+    rows = response.get('bars', {}).get(symbol, [])
+    if not isinstance(rows, list):
+        raise RuntimeError(f'Invalid bars response for {symbol}')
+    duration = timedelta(hours=1 if timeframe == '1Hour' else 4)
     completed = []
-    for b in rows:
-        stamp = datetime.fromisoformat(b['t'].replace('Z', '+00:00'))
-        if stamp + timedelta(hours=1) <= end:
-            completed.append(b)
-    if len(completed) < 60:
-        raise RuntimeError(f'Insufficient complete bars for {symbol}: {len(completed)}')
-    if datetime.fromisoformat(completed[-1]['t'].replace('Z', '+00:00')) < end - timedelta(hours=3):
-        raise RuntimeError(f'Stale bars for {symbol}')
+    for row in rows:
+        timestamp = datetime.fromisoformat(row['t'].replace('Z', '+00:00'))
+        if timestamp + duration <= now:
+            completed.append(row)
+    completed = list({b['t']: b for b in completed}.values())
+    completed.sort(key=lambda b: b['t'])
+    if len(completed) < min_count:
+        raise RuntimeError(f'Only {len(completed)} completed {timeframe} bars for {symbol}')
+    last_start = datetime.fromisoformat(completed[-1]['t'].replace('Z', '+00:00'))
+    # Do not use an arbitrary 3-hour cutoff. Report gaps and skip stale markets.
+    # For 1h, accept up to 4h since last bar close; for 4h, up to 8h.
+    freshness = timedelta(hours=4 if timeframe == '1Hour' else 8)
+    age = now - (last_start + duration)
+    if age > freshness:
+        raise RuntimeError(f'Stale {timeframe} bars for {symbol}: last completed close '
+                           f'{(last_start + duration).isoformat()}, age {age}')
     return completed
 
 
-def signal(rows):
-    closes = [float(b['c']) for b in rows]
-    fast, slow = ema(closes, 9), ema(closes, 21)
+def rsi14(closes):
+    changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [max(0.0, c) for c in changes[-14:]]
+    losses = [max(0.0, -c) for c in changes[-14:]]
+    avg_gain, avg_loss = sum(gains)/14, sum(losses)/14
+    return 100.0 if avg_loss == 0 else 100 - 100/(1 + avg_gain/avg_loss)
+
+
+def atr14(rows):
     trs = []
     for i in range(1, len(rows)):
-        hi, lo, pc = float(rows[i]['h']), float(rows[i]['l']), closes[i-1]
-        trs.append(max(hi-lo, abs(hi-pc), abs(lo-pc)))
-    atr = sum(trs[-14:]) / 14
+        h, l, pc = float(rows[i]['h']), float(rows[i]['l']), float(rows[i-1]['c'])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-14:]) / 14
+
+
+def evaluate(hourly, four_hour):
+    closes = [float(b['c']) for b in hourly]
+    volumes = [float(b.get('v', 0)) for b in hourly]
+    higher = [float(b['c']) for b in four_hour]
+    e9, e21, e50 = (ema(closes, n) for n in (9, 21, 50))
+    h21, h50 = ema(higher, 21), ema(higher, 50)
     price = closes[-1]
-    # New upward crossover on the last completed 1-hour candle only.
-    cross = fast[-2] <= slow[-2] and fast[-1] > slow[-1]
-    trend = price > slow[-1]
-    return price, atr, bool(cross and trend), rows[-1]['t']
+    atr = atr14(hourly)
+    if price <= 0 or atr <= 0:
+        raise RuntimeError('Invalid price or ATR')
+    # Score measures agreement of technical evidence, not calibrated win probability.
+    trend4 = higher[-1] > h21[-1] > h50[-1]
+    trend1 = price > e21[-1] > e50[-1]
+    ema_good = e9[-1] > e21[-1] and e9[-1] >= e9[-2]
+    recent_breakout = price > max(float(b['h']) for b in hourly[-7:-1])
+    vol_avg = sum(volumes[-21:-1]) / 20
+    volume_good = vol_avg > 0 and volumes[-1] >= 1.2 * vol_avg
+    candle_good = float(hourly[-1]['c']) > float(hourly[-1]['o'])
+    rsi = rsi14(closes)
+    rsi_good = 45 <= rsi <= 72
+    atr_pct = atr / price
+    volatility_good = .002 <= atr_pct <= .08
+    # Previous 24 fully completed hourly bars: high/low and breakout context.
+    day_high = max(float(b['h']) for b in hourly[-25:-1])
+    day_low = min(float(b['l']) for b in hourly[-25:-1])
+    day_range = day_high - day_low
+    range_position = (price - day_low) / day_range if day_range > 0 else 0.5
+    # Entry requires an actual price trigger, not merely a high score.
+    trigger = (recent_breakout or (closes[-2] <= e9[-2] and price > e9[-1])) and range_position >= 0.5
+    score = (25 * trend4 + 20 * trend1 + 15 * ema_good +
+             10 * recent_breakout + 10 * volume_good +
+             5 * candle_good + 10 * volatility_good + 5 * rsi_good)
+    return dict(price=price, atr=atr, score=int(score), trigger=trigger,
+                trend4=trend4, trend1=trend1, volume=volume_good,
+                bar=hourly[-1]['t'], day_high=day_high, day_low=day_low,
+                range_position=range_position, rsi=rsi,
+                atr_pct=100*atr_pct, breakout=recent_breakout)
 
 
-def positions():
-    return api('GET', '/v2/positions')
-
-
-def orders():
-    after = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    return api('GET', '/v2/orders', params={'status':'all','limit':100,'after':after,'direction':'desc'})
-
-
-def place(symbol, side, *, notional=None, qty=None):
-    body = {'symbol':symbol, 'side':side, 'type':'market', 'time_in_force':'gtc'}
-    if notional is not None:
-        body['notional'] = str(round(notional, 2))
-    else:
-        body['qty'] = str(qty)
-    return api('POST', '/v2/orders', payload=body)
+def sizing(score, equity, buying_power, price, atr):
+    tier = next(((risk, dollars) for cutoff, risk, dollars in RISK_TIERS
+                 if score >= cutoff), None)
+    if tier is None:
+        return None
+    risk_fraction, tier_dollars = tier
+    # Stops based on volatility; farther stops result in smaller position sizes.
+    stop_distance = 1.5 * atr
+    if stop_distance <= 0 or stop_distance >= price:
+        return None
+    risk_budget = equity * risk_fraction
+    notional = min(MAX_TRADE_USD, tier_dollars, .25 * equity,
+                   .95 * max(0, buying_power), risk_budget / stop_distance * price)
+    if notional < 1.05:
+        return None
+    return dict(notional=notional, stop=price-stop_distance,
+                target=price+3*stop_distance,
+                estimated_loss=notional/price*stop_distance,
+                risk_pct=risk_fraction*100)
 
 
 def main():
-    acct = api('GET', '/v2/account')
-    equity = float(acct['equity'])
-    buying_power = float(acct['buying_power'])
-    previous = float(acct.get('last_equity') or equity)
-    if equity <= 0: raise RuntimeError('Account equity is zero')
-    if previous > 0 and equity < previous * (1 - DAILY_LOSS_LIMIT):
-        notify('PAPER BOT PAUSED: account down >2% vs previous close. Review manually.')
+    account = api(PAPER_API, '/v2/account')
+    equity = float(account['equity'])
+    previous = float(account.get('last_equity') or equity)
+    power = float(account.get('buying_power') or 0)
+    if equity <= 0:
+        raise RuntimeError('Paper account equity is zero')
+    symbols = discover_markets()
+    notify(f'PAPER SIGNAL SCAN started | {len(symbols)} crypto markets | equity ${equity:.2f} | '
+           f'mode SIGNALS ONLY (no orders)')
+    if previous > 0 and equity <= previous * (1 - DAILY_LOSS_PCT/100):
+        notify(f'PAUSED: equity below previous close by {DAILY_LOSS_PCT:.2f}% or more')
         return
-    current = positions()
-    pending = api('GET', '/v2/orders', params={'status':'open', 'limit':100})
-    recent = orders()
-    # Avoid new entries while any position/order exists; avoid repeat buys in past 24h.
-    for symbol in SYMBOLS:
+    positions = api(PAPER_API, '/v2/positions')
+    open_orders = api(PAPER_API, '/v2/orders', {'status': 'open', 'limit': 100})
+    blocked = bool(positions or open_orders)
+    if blocked:
+        notify('Entry alerts blocked: paper account has existing positions or open orders; market scans continue')
+    failures = []
+    candidates = []
+    for symbol in symbols:
         try:
-            candles = bars(symbol)
-            price, atr, enter, timestamp = signal(candles)
-            name = symbol.replace('/', '')
-            pos = next((p for p in current if p['symbol'].replace('/','') == name), None)
-            if pos:
-                entry_price = float(pos['avg_entry_price'])
-                # Stops are software-managed, checked on scheduled runs only.
-                # Dynamic ATR from current bars; not an exchange-native protective stop.
-                stop = entry_price - 1.5*atr
-                take = entry_price + 3*atr
-                if price <= stop or price >= take:
-                    reason = 'STOP' if price <= stop else 'TARGET'
-                    if ENABLE_ORDERS:
-                        result = place(symbol, 'sell', qty=pos['qty_available'])
-                        notify(f'PAPER SELL SUBMITTED {symbol}: {reason}, price~{price:.5f}, order={result["id"]}')
-                    else:
-                        notify(f'DRY RUN sell signal {symbol}: {reason}, price~{price:.5f}')
+            hourly = get_bars(symbol, '1Hour', 24*12, 70)
+            four_hour = get_bars(symbol, '4Hour', 24*25, 60)
+            result = evaluate(hourly, four_hour)
+            score = result['score']
+            RUN_RESULTS.append({'symbol': symbol, 'time_utc': datetime.now(timezone.utc).isoformat(),
+                                'bar': result['bar'], 'score': score,
+                                'price': result['price'], 'atr14': result['atr'],
+                                'rsi14': round(result['rsi'], 2),
+                                'high_24h': result['day_high'], 'low_24h': result['day_low'],
+                                'trigger': bool(result['trigger']), 'entries_blocked': blocked})
+            print(f'{symbol} previous 24h high ${result["day_high"]:.5f}; '
+                  f'low ${result["day_low"]:.5f}; '
+                  f'range position {result["range_position"]:.0%}', flush=True)
+            if blocked or score < MIN_SCORE or not result['trigger'] or not result['trend4'] or not result['trend1']:
+                print(f'{symbol}: score {score}/100; no qualified entry; '
+                      f'RSI {result["rsi"]:.1f}; bar {result["bar"]}', flush=True)
                 continue
-            if not enter: continue
-            if current or pending: continue
-            if any(o.get('side')=='buy' and o.get('symbol','').replace('/','')==name for o in recent):
+            size = sizing(score, equity, power, result['price'], result['atr'])
+            if not size:
+                print(f'{symbol}: signal but risk/size constraints reject entry', flush=True)
                 continue
-            stop_distance = 1.5*atr
-            if stop_distance <= 0: continue
-            risk_dollars = equity * RISK
-            units = risk_dollars / stop_distance
-            notional = min(units*price, equity*MAX_ALLOCATION, buying_power*0.95)
-            if notional < 1.05: continue
-            planned_loss = notional/price * stop_distance
-            msg = (f'PAPER SIGNAL {symbol} | bar {timestamp}\nEntry~${price:.5f}; '
-                   f'notional ${notional:.2f}; estimated risk ${planned_loss:.2f}; '
-                   f'stop~${price-stop_distance:.5f}; target~${price+3*atr:.5f}; '
-                   f'hold: hours to days; mode: {"PAPER ORDERS" if ENABLE_ORDERS else "DRY RUN"}')
-            notify(msg)
-            if ENABLE_ORDERS:
-                result = place(symbol, 'buy', notional=notional)
-                notify(f'PAPER BUY SUBMITTED {symbol}: order={result["id"]} (not necessarily filled)')
-                break
-        except Exception as ex:
-            notify(f'Bot check error for {symbol}: {type(ex).__name__}: {str(ex)[:180]}')
+            candidates.append((score, symbol, result, size))
+            print(f'QUALIFIED {symbol} score {score}/100, allocation ${size["notional"]:.2f}', flush=True)
+        except (requests.RequestException, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            failures.append(f'{symbol}: {type(exc).__name__}: {str(exc)[:220]}')
+            RUN_RESULTS.append({'symbol': symbol, 'error': failures[-1],
+                                'time_utc': datetime.now(timezone.utc).isoformat()})
+            notify(f'MARKET DATA ERROR {failures[-1]}')
+    # Rank every valid candidate; report only the strongest to reduce alert spam.
+    candidates.sort(key=lambda item: (item[0], -item[3]['estimated_loss']), reverse=True)
+    if candidates:
+        score, symbol, result, size = candidates[0]
+        notify(f'TOP PAPER CANDIDATE: {symbol} | score {score}/100 (not win probability)\n'
+               f'1h candle {result["bar"]} | reference ${result["price"]:.6f}\n'
+               f'24h high ${result["day_high"]:.6f} / low ${result["day_low"]:.6f}\n'
+               f'Allocation ${size["notional"]:.2f} | planned risk ${size["estimated_loss"]:.2f}\n'
+               f'Indicative stop ${size["stop"]:.6f} / target ${size["target"]:.6f}\n'
+               f'NO ORDER PLACED; NO AUTOMATED STOP ACTIVE.')
+    else:
+        print('No qualified candidate. No trade recommended.', flush=True)
+    with open('scan_results.json', 'w', encoding='utf-8') as report:
+        json.dump({'generated_utc': datetime.now(timezone.utc).isoformat(),
+                   'signals_only': True, 'equity': equity, 'scanned': len(symbols), 'results': RUN_RESULTS},
+                  report, indent=2)
+    if len(failures) == len(symbols):
+        raise RuntimeError('All market scans failed. Review logs; do not trade.')
+    notify(f'PAPER SCAN finished | {len(symbols)-len(failures)}/{len(symbols)} markets checked')
 
 
 if __name__ == '__main__':
     try:
         main()
     except Exception as exc:
-        notify(f'PAPER BOT ERROR: {type(exc).__name__}: {str(exc)[:200]}')
+        notify(f'PAPER BOT FAILED: {type(exc).__name__}: {str(exc)[:250]}')
         sys.exit(1)
