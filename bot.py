@@ -187,13 +187,45 @@ def sizing(score, equity, buying_power, price, atr):
                 risk_pct=risk_fraction*100)
 
 
+def diagnose_crypto_feed():
+    """Compare latest crypto bars with historical endpoint."""
+    for symbol in ('BTC/USD', 'ETH/USD', 'SOL/USD'):
+        try:
+            result = api(
+                DATA_API,
+                '/v1beta3/crypto/us/latest/bars',
+                {'symbols': symbol}
+            )
+            latest = result.get('bars', {}).get(symbol)
+            if latest:
+                print(
+                    f'FEED DIAGNOSTIC {symbol}: '
+                    f'latest_timestamp={latest.get("t")} '
+                    f'latest_close={latest.get("c")}',
+                    flush=True
+                )
+            else:
+                print(
+                    f'FEED DIAGNOSTIC {symbol}: '
+                    f'No latest bar returned; response={str(result)[:300]}',
+                    flush=True
+                )
+        except Exception as exc:
+            print(
+                f'FEED DIAGNOSTIC {symbol}: '
+                f'{type(exc).__name__}: {str(exc)[:300]}',
+                flush=True
+            )
+
+
 def main():
     account = api(PAPER_API, '/v2/account')
     equity = float(account['equity'])
     previous = float(account.get('last_equity') or equity)
     power = float(account.get('buying_power') or 0)
     if equity <= 0:
-        raise RuntimeError('Paper account equity is zero')
+        raise RuntimeError('Paper account equity is zero')   
+    diagnose_crypto_feed()
     symbols = discover_markets()
     notify(f'PAPER SIGNAL SCAN started | {len(symbols)} crypto markets | equity ${equity:.2f} | '
            f'mode SIGNALS ONLY (no orders)')
