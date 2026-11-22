@@ -1,298 +1,398 @@
+"""Alpaca PAPER-ONLY crypto scanner and optional paper order executor.
 
-"""Alpaca crypto signal scanner. NO ORDER EXECUTION; designed for paper testing.
+Python 3.10+. Dependency: requests>=2.31,<3.
+Environment: ALPACA_PAPER_KEY, ALPACA_PAPER_SECRET.
+Optional: ENABLE_PAPER_ORDERS=false, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+MAX_MARKETS=20, MIN_CONFIDENCE_SCORE=75, MAX_TRADE_USD=50,
+MAX_DAILY_LOSS_PCT=2, RISK_PER_TRADE_PCT=0.5, MAX_OPEN_POSITIONS=3.
 
-Requires ALPACA_PAPER_KEY and ALPACA_PAPER_SECRET in environment.
-Optional TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
-This scanner NEVER sends trade orders, regardless of ENABLE_ORDERS.
+IMPORTANT: Stop/target levels are monitored by subsequent runs, NOT broker-native
+protective orders. Running periodically cannot guarantee a stop fill. Paper only.
 """
+import json
+import logging
+import math
 import os
 import sys
-import math
-import json
-import requests
+import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-KEY = os.environ['ALPACA_PAPER_KEY']
-SECRET = os.environ['ALPACA_PAPER_SECRET']
-HEAD = {'APCA-API-KEY-ID': KEY, 'APCA-API-SECRET-KEY': SECRET}
-PAPER_API = 'https://paper-api.alpaca.markets'
-DATA_API = 'https://data.alpaca.markets'
-CORE_SYMBOLS = ('BTC/USD', 'ETH/USD', 'SOL/USD')
-MAX_MARKETS = max(3, min(40, int(os.getenv('MAX_MARKETS', '20'))))
-SCAN_ALL_CRYPTO = os.getenv('SCAN_ALL_CRYPTO', 'true').lower() == 'true'
-# No live or paper orders: this scanner only produces candidate signals.
-ENABLE_ORDERS = False
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-CHAT = os.getenv('TELEGRAM_CHAT_ID', '')
-MAX_TRADE_USD = min(100.0, max(0.0, float(os.getenv('MAX_TRADE_USD', '100'))))
-MIN_SCORE = max(0, min(100, int(os.getenv('MIN_CONFIDENCE_SCORE', '70'))))
-DAILY_LOSS_PCT = min(2.0, max(0.0, float(os.getenv('MAX_DAILY_LOSS_PCT', '2'))))
-# Limit risk even at the highest score; not a probability-of-success estimate.
-RISK_TIERS = ((95, .01, 100), (90, .0075, 75), (80, .005, 50), (70, .0025, 25))
-RUN_RESULTS = []
+import requests
+
+PAPER = "https://paper-api.alpaca.markets"
+DATA = "https://data.alpaca.markets"
+LOG = logging.getLogger("paperbot")
+CORE = ("BTC/USD", "ETH/USD", "SOL/USD")
+STATE_PATH = Path(os.getenv("STATE_FILE", "paper_bot_state.json"))
+REPORT_PATH = Path(os.getenv("REPORT_FILE", "scan_results.json"))
+
+
+def env_float(name, default, low, high):
+    try:
+        value = float(os.getenv(name, default))
+        if not math.isfinite(value):
+            raise ValueError("not finite")
+        return min(high, max(low, value))
+    except ValueError as exc:
+        raise ValueError(f"Invalid {name}: {exc}") from exc
+
+
+def env_int(name, default, low, high):
+    try:
+        return min(high, max(low, int(os.getenv(name, default))))
+    except ValueError as exc:
+        raise ValueError(f"Invalid {name}: {exc}") from exc
+
+
+class Alpaca:
+    def __init__(self):
+        key = os.getenv("ALPACA_PAPER_KEY")
+        secret = os.getenv("ALPACA_PAPER_SECRET")
+        if not key or not secret:
+            raise RuntimeError("Set ALPACA_PAPER_KEY and ALPACA_PAPER_SECRET")
+        self.session = requests.Session()
+        self.session.headers.update({"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret})
+
+    def request(self, method, base, path, *, params=None, payload=None):
+        # Retry GET only. Retrying POST can create duplicate orders after timeouts.
+        attempts = 4 if method == "GET" else 1
+        for attempt in range(attempts):
+            try:
+                response = self.session.request(method, base + path, params=params,
+                                                json=payload, timeout=25)
+                if method == "GET" and response.status_code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                    wait = min(12, 2 ** attempt)
+                    time.sleep(wait)
+                    continue
+                response.raise_for_status()
+                return response.json() if response.content else {}
+            except requests.RequestException:
+                if method != "GET" or attempt == attempts - 1:
+                    raise
+                time.sleep(min(12, 2 ** attempt))
+
+    def account(self):
+        return self.request("GET", PAPER, "/v2/account")
+
+    def assets(self):
+        return self.request("GET", PAPER, "/v2/assets", params={"status": "active", "asset_class": "crypto"})
+
+    def positions(self):
+        return self.request("GET", PAPER, "/v2/positions")
+
+    def orders(self):
+        return self.request("GET", PAPER, "/v2/orders", params={"status": "open", "limit": 500})
+
+    def bars(self, symbol, hours=24 * 40):
+        now = datetime.now(timezone.utc)
+        params = {"symbols": symbol, "timeframe": "1Hour",
+                  "start": (now - timedelta(hours=hours)).isoformat().replace("+00:00", "Z"),
+                  "end": now.isoformat().replace("+00:00", "Z"),
+                  "limit": 1000, "sort": "asc"}
+        found = {}
+        token = None
+        for _ in range(12):
+            if token:
+                params["page_token"] = token
+            response = self.request("GET", DATA, "/v1beta3/crypto/us/bars", params=params)
+            for bar in response.get("bars", {}).get(symbol, []):
+                stamp = parse_time(bar["t"])
+                if stamp + timedelta(hours=1) <= now:
+                    found[stamp] = bar
+            next_token = response.get("next_page_token")
+            if not next_token or next_token == token:
+                break
+            token = next_token
+        rows = [found[t] for t in sorted(found)]
+        if len(rows) < 240:
+            raise ValueError(f"Insufficient hourly candles: {len(rows)} (need 240)")
+        last_close = parse_time(rows[-1]["t"]) + timedelta(hours=1)
+        if now - last_close > timedelta(hours=4):
+            raise ValueError(f"Stale hourly candle: {last_close.isoformat()}")
+        return rows
+
+    def submit_buy(self, symbol, dollars, client_id):
+        return self.request("POST", PAPER, "/v2/orders", payload={
+            "symbol": symbol, "notional": f"{dollars:.2f}", "side": "buy",
+            "type": "market", "time_in_force": "gtc", "client_order_id": client_id})
+
+    def submit_sell(self, symbol, qty, client_id):
+        return self.request("POST", PAPER, "/v2/orders", payload={
+            "symbol": symbol, "qty": str(qty), "side": "sell",
+            "type": "market", "time_in_force": "gtc", "client_order_id": client_id})
+
+
+def parse_time(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def as_number(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Nonfinite market value")
+    return number
+
+
+def ema(values, period):
+    alpha = 2 / (period + 1)
+    output = [values[0]]
+    for value in values[1:]:
+        output.append(alpha * value + (1 - alpha) * output[-1])
+    return output
+
+
+def rsi(values, period=14):
+    diffs = [b - a for a, b in zip(values, values[1:])]
+    gain = sum(max(d, 0) for d in diffs[:period]) / period
+    loss = sum(max(-d, 0) for d in diffs[:period]) / period
+    for diff in diffs[period:]:
+        gain = (gain * (period - 1) + max(diff, 0)) / period
+        loss = (loss * (period - 1) + max(-diff, 0)) / period
+    if gain == loss == 0:
+        return 50.0
+    if loss == 0:
+        return 100.0
+    return 100 - 100 / (1 + gain / loss)
+
+
+def atr(rows, period=14):
+    true_ranges = []
+    for previous, current in zip(rows, rows[1:]):
+        high, low, prior_close = (as_number(current["h"]), as_number(current["l"]),
+                                  as_number(previous["c"]))
+        true_ranges.append(max(high - low, abs(high - prior_close), abs(low - prior_close)))
+    value = sum(true_ranges[:period]) / period
+    for tr in true_ranges[period:]:
+        value = (value * (period - 1) + tr) / period
+    return value
+
+
+def aggregate_four_hour(rows):
+    buckets = {}
+    for bar in rows:
+        ts = parse_time(bar["t"])
+        bucket = ts.replace(hour=(ts.hour // 4) * 4, minute=0, second=0, microsecond=0)
+        buckets.setdefault(bucket, []).append(bar)
+    result = []
+    for bucket, bars in sorted(buckets.items()):
+        # Require all four expected consecutive hourly candles.
+        stamps = {parse_time(bar["t"]) for bar in bars}
+        if stamps != {bucket + timedelta(hours=i) for i in range(4)}:
+            continue
+        bars.sort(key=lambda b: b["t"])
+        result.append({"t": bucket.isoformat(), "o": bars[0]["o"],
+                       "h": max(as_number(b["h"]) for b in bars),
+                       "l": min(as_number(b["l"]) for b in bars),
+                       "c": bars[-1]["c"], "v": sum(as_number(b.get("v", 0)) for b in bars)})
+    return result
+
+
+def evaluate(rows):
+    higher = aggregate_four_hour(rows)
+    if len(higher) < 55:
+        raise ValueError(f"Insufficient complete 4-hour candles: {len(higher)}")
+    closes = [as_number(b["c"]) for b in rows]
+    volumes = [as_number(b.get("v", 0)) for b in rows]
+    four_closes = [as_number(b["c"]) for b in higher]
+    if any(x <= 0 for x in closes) or any(x < 0 for x in volumes):
+        raise ValueError("Invalid price/volume")
+    e9, e21, e50 = (ema(closes, n) for n in (9, 21, 50))
+    h21, h50 = ema(four_closes, 21), ema(four_closes, 50)
+    macd = [a - b for a, b in zip(ema(closes, 12), ema(closes, 26))]
+    signal = ema(macd, 9)
+    price, volatility = closes[-1], atr(rows)
+    if volatility <= 0:
+        raise ValueError("Zero ATR")
+    trend4 = four_closes[-1] > h21[-1] > h50[-1]
+    trend1 = price > e21[-1] > e50[-1]
+    momentum = e9[-1] > e21[-1] and e9[-1] > e9[-2]
+    breakout = price > max(as_number(b["h"]) for b in rows[-7:-1])
+    avg_volume = sum(volumes[-21:-1]) / 20
+    volume_ok = avg_volume > 0 and volumes[-1] >= avg_volume * 1.2
+    rsi_value = rsi(closes)
+    rsi_ok = 45 <= rsi_value <= 72
+    macd_ok = macd[-1] > signal[-1] and macd[-1] > macd[-2]
+    volatility_pct = volatility / price
+    volatility_ok = 0.002 <= volatility_pct <= 0.08
+    day_high = max(as_number(b["h"]) for b in rows[-25:-1])
+    day_low = min(as_number(b["l"]) for b in rows[-25:-1])
+    position = (price - day_low) / (day_high - day_low) if day_high > day_low else 0.5
+    trigger = (breakout or (closes[-2] <= e9[-2] and price > e9[-1])) and position >= 0.5
+    score = (20 * trend4 + 20 * trend1 + 15 * momentum + 10 * breakout +
+             10 * volume_ok + 10 * macd_ok + 5 * rsi_ok + 10 * volatility_ok)
+    return {"price": price, "atr": volatility, "score": int(score),
+            "rsi": round(rsi_value, 2), "trigger": bool(trigger),
+            "trend4": bool(trend4), "trend1": bool(trend1), "macd_ok": bool(macd_ok),
+            "bar": rows[-1]["t"], "high24": day_high, "low24": day_low,
+            "volume_ok": bool(volume_ok), "breakout": bool(breakout)}
 
 
 def notify(message):
-    print(message, flush=True)
-    if TOKEN and CHAT:
+    LOG.info("%s", message)
+    token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if token and chat:
         try:
-            r = requests.post(f'https://api.telegram.org/bot{TOKEN}/sendMessage',
-                              json={'chat_id': CHAT, 'text': message[:4000]}, timeout=12)
-            r.raise_for_status()
+            response = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                                     json={"chat_id": chat, "text": message[:4000]}, timeout=12)
+            response.raise_for_status()
         except requests.RequestException as exc:
-            print(f'Telegram notification failed: {exc}', file=sys.stderr)
+            LOG.warning("Telegram notification failed: %s", exc.__class__.__name__)
 
 
-def api(root, path, params=None):
-    r = requests.get(root + path, headers=HEAD, params=params, timeout=25)
-    r.raise_for_status()
-    return r.json()
+def load_state():
+    if not STATE_PATH.exists():
+        return {"managed": {}}
+    try:
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(state.get("managed"), dict):
+            raise ValueError("Invalid state format")
+        return state
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Cannot safely read state: {exc}") from exc
 
 
-def discover_markets():
-    """Discover Alpaca-tradeable crypto pairs, rather than assuming every token is supported."""
-    if not SCAN_ALL_CRYPTO:
-        return list(CORE_SYMBOLS)
-    assets = api(PAPER_API, '/v2/assets', {'status': 'active', 'asset_class': 'crypto'})
-    candidates = set(CORE_SYMBOLS)
-    for asset in assets:
-        if not asset.get('tradable', False):
-            continue
-        symbol = asset.get('symbol', '')
-        if '/' not in symbol or not symbol.endswith('/USD'):
-            continue
-        candidates.add(symbol)
-    # The first scan prioritizes the three core symbols; cap to limit free CI/API use.
-    return list(CORE_SYMBOLS) + sorted(candidates - set(CORE_SYMBOLS))[:MAX_MARKETS-3]
+def save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
-def ema(values, span):
-    result = values[0]
-    alpha = 2 / (span + 1)
-    out = []
-    for value in values:
-        result = alpha * value + (1 - alpha) * result
-        out.append(result)
-    return out
-
-
-def get_bars(symbol, timeframe, hours, min_count):
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=hours)
-    # Fetch one symbol at a time. Crypto feeds may contain gaps in hourly bars.
-    response = api(DATA_API, '/v1beta3/crypto/us/bars', {
-        'symbols': symbol, 'timeframe': timeframe,
-        'start': start.isoformat().replace('+00:00', 'Z'),
-        'end': now.isoformat().replace('+00:00', 'Z'),
-        'limit': 1000,
-        'sort': 'asc',
-    })
-    rows = response.get('bars', {}).get(symbol, [])
-    if not isinstance(rows, list):
-        raise RuntimeError(f'Invalid bars response for {symbol}')
-    duration = timedelta(hours=1 if timeframe == '1Hour' else 4)
-    completed = []
-    for row in rows:
-        timestamp = datetime.fromisoformat(row['t'].replace('Z', '+00:00'))
-        if timestamp + duration <= now:
-            completed.append(row)
-    completed = list({b['t']: b for b in completed}.values())
-    completed.sort(key=lambda b: b['t'])
-    if len(completed) < min_count:
-        raise RuntimeError(f'Only {len(completed)} completed {timeframe} bars for {symbol}')
-    last_start = datetime.fromisoformat(completed[-1]['t'].replace('Z', '+00:00'))
-    # Do not use an arbitrary 3-hour cutoff. Report gaps and skip stale markets.
-    # For 1h, accept up to 4h since last bar close; for 4h, up to 8h.
-    freshness = timedelta(hours=4 if timeframe == '1Hour' else 8)
-    age = now - (last_start + duration)
-    if age > freshness:
-        raise RuntimeError(f'Stale {timeframe} bars for {symbol}: last completed close '
-                           f'{(last_start + duration).isoformat()}, age {age}')
-    return completed
-
-
-def rsi14(closes):
-    changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [max(0.0, c) for c in changes[-14:]]
-    losses = [max(0.0, -c) for c in changes[-14:]]
-    avg_gain, avg_loss = sum(gains)/14, sum(losses)/14
-    return 100.0 if avg_loss == 0 else 100 - 100/(1 + avg_gain/avg_loss)
-
-
-def atr14(rows):
-    trs = []
-    for i in range(1, len(rows)):
-        h, l, pc = float(rows[i]['h']), float(rows[i]['l']), float(rows[i-1]['c'])
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    return sum(trs[-14:]) / 14
-
-
-def evaluate(hourly, four_hour):
-    closes = [float(b['c']) for b in hourly]
-    volumes = [float(b.get('v', 0)) for b in hourly]
-    higher = [float(b['c']) for b in four_hour]
-    e9, e21, e50 = (ema(closes, n) for n in (9, 21, 50))
-    h21, h50 = ema(higher, 21), ema(higher, 50)
-    price = closes[-1]
-    atr = atr14(hourly)
-    if price <= 0 or atr <= 0:
-        raise RuntimeError('Invalid price or ATR')
-    # Score measures agreement of technical evidence, not calibrated win probability.
-    trend4 = higher[-1] > h21[-1] > h50[-1]
-    trend1 = price > e21[-1] > e50[-1]
-    ema_good = e9[-1] > e21[-1] and e9[-1] >= e9[-2]
-    recent_breakout = price > max(float(b['h']) for b in hourly[-7:-1])
-    vol_avg = sum(volumes[-21:-1]) / 20
-    volume_good = vol_avg > 0 and volumes[-1] >= 1.2 * vol_avg
-    candle_good = float(hourly[-1]['c']) > float(hourly[-1]['o'])
-    rsi = rsi14(closes)
-    rsi_good = 45 <= rsi <= 72
-    atr_pct = atr / price
-    volatility_good = .002 <= atr_pct <= .08
-    # Previous 24 fully completed hourly bars: high/low and breakout context.
-    day_high = max(float(b['h']) for b in hourly[-25:-1])
-    day_low = min(float(b['l']) for b in hourly[-25:-1])
-    day_range = day_high - day_low
-    range_position = (price - day_low) / day_range if day_range > 0 else 0.5
-    # Entry requires an actual price trigger, not merely a high score.
-    trigger = (recent_breakout or (closes[-2] <= e9[-2] and price > e9[-1])) and range_position >= 0.5
-    score = (25 * trend4 + 20 * trend1 + 15 * ema_good +
-             10 * recent_breakout + 10 * volume_good +
-             5 * candle_good + 10 * volatility_good + 5 * rsi_good)
-    return dict(price=price, atr=atr, score=int(score), trigger=trigger,
-                trend4=trend4, trend1=trend1, volume=volume_good,
-                bar=hourly[-1]['t'], day_high=day_high, day_low=day_low,
-                range_position=range_position, rsi=rsi,
-                atr_pct=100*atr_pct, breakout=recent_breakout)
-
-
-def sizing(score, equity, buying_power, price, atr):
-    tier = next(((risk, dollars) for cutoff, risk, dollars in RISK_TIERS
-                 if score >= cutoff), None)
-    if tier is None:
-        return None
-    risk_fraction, tier_dollars = tier
-    # Stops based on volatility; farther stops result in smaller position sizes.
-    stop_distance = 1.5 * atr
-    if stop_distance <= 0 or stop_distance >= price:
-        return None
-    risk_budget = equity * risk_fraction
-    notional = min(MAX_TRADE_USD, tier_dollars, .25 * equity,
-                   .95 * max(0, buying_power), risk_budget / stop_distance * price)
-    if notional < 1.05:
-        return None
-    return dict(notional=notional, stop=price-stop_distance,
-                target=price+3*stop_distance,
-                estimated_loss=notional/price*stop_distance,
-                risk_pct=risk_fraction*100)
-
-
-def diagnose_crypto_feed():
-    """Compare latest crypto bars with historical endpoint."""
-    for symbol in ('BTC/USD', 'ETH/USD', 'SOL/USD'):
-        try:
-            result = api(
-                DATA_API,
-                '/v1beta3/crypto/us/latest/bars',
-                {'symbols': symbol}
-            )
-            latest = result.get('bars', {}).get(symbol)
-            if latest:
-                print(
-                    f'FEED DIAGNOSTIC {symbol}: '
-                    f'latest_timestamp={latest.get("t")} '
-                    f'latest_close={latest.get("c")}',
-                    flush=True
-                )
-            else:
-                print(
-                    f'FEED DIAGNOSTIC {symbol}: '
-                    f'No latest bar returned; response={str(result)[:300]}',
-                    flush=True
-                )
-        except Exception as exc:
-            print(
-                f'FEED DIAGNOSTIC {symbol}: '
-                f'{type(exc).__name__}: {str(exc)[:300]}',
-                flush=True
-            )
+def position_symbol(item):
+    return str(item.get("symbol", "")).replace("/", "").upper()
 
 
 def main():
-    account = api(PAPER_API, '/v2/account')
-    equity = float(account['equity'])
-    previous = float(account.get('last_equity') or equity)
-    power = float(account.get('buying_power') or 0)
+    execute = os.getenv("ENABLE_PAPER_ORDERS", "false").lower() == "true"
+    max_markets = env_int("MAX_MARKETS", 20, 3, 100)
+    min_score = env_int("MIN_CONFIDENCE_SCORE", 75, 0, 100)
+    max_trade = env_float("MAX_TRADE_USD", 50, 0, 1000)
+    risk_pct = env_float("RISK_PER_TRADE_PCT", 0.5, 0, 2)
+    loss_pct = env_float("MAX_DAILY_LOSS_PCT", 2, 0, 10)
+    max_positions = env_int("MAX_OPEN_POSITIONS", 3, 1, 20)
+    api = Alpaca()
+    account = api.account()
+    equity = as_number(account["equity"])
+    buying_power = max(0, as_number(account.get("buying_power") or 0))
+    last_equity = as_number(account.get("last_equity") or equity)
     if equity <= 0:
-        raise RuntimeError('Paper account equity is zero')   
-    diagnose_crypto_feed()
-    symbols = discover_markets()
-    notify(f'PAPER SIGNAL SCAN started | {len(symbols)} crypto markets | equity ${equity:.2f} | '
-           f'mode SIGNALS ONLY (no orders)')
-    if previous > 0 and equity <= previous * (1 - DAILY_LOSS_PCT/100):
-        notify(f'PAUSED: equity below previous close by {DAILY_LOSS_PCT:.2f}% or more')
-        return
-    positions = api(PAPER_API, '/v2/positions')
-    open_orders = api(PAPER_API, '/v2/orders', {'status': 'open', 'limit': 100})
-    blocked = bool(positions or open_orders)
-    if blocked:
-        notify('Entry alerts blocked: paper account has existing positions or open orders; market scans continue')
-    failures = []
-    candidates = []
+        raise RuntimeError("Paper equity must be positive")
+    # Note: Alpaca last_equity is not necessarily a rolling 24-hour high-water mark.
+    daily_block = last_equity > 0 and equity <= last_equity * (1 - loss_pct / 100)
+    positions = api.positions()
+    open_orders = api.orders()
+    state = load_state()
+    owned = {position_symbol(p): p for p in positions}
+    pending = {position_symbol(o) for o in open_orders}
+    assets = [a for a in api.assets() if a.get("tradable") and
+              a.get("status") == "active" and str(a.get("symbol", "")).endswith("/USD")]
+    asset_symbols = {a["symbol"] for a in assets}
+    symbols = [s for s in CORE if s in asset_symbols]
+    symbols += sorted(asset_symbols - set(symbols))[:max(0, max_markets - len(symbols))]
+    if not symbols:
+        raise RuntimeError("No active tradeable USD crypto pairs found")
+    notify(f"PAPER BOT start | mode={'PAPER ORDERS' if execute else 'SIGNALS ONLY'} | "
+           f"markets={len(symbols)} equity=${equity:.2f}")
+    if daily_block:
+        notify("Daily equity-loss threshold reached: NEW ENTRIES BLOCKED")
+    results, candidates, errors = [], [], []
+    latest_by_symbol = {}
     for symbol in symbols:
         try:
-            hourly = get_bars(symbol, '1Hour', 24*12, 70)
-            four_hour = get_bars(symbol, '4Hour', 24*25, 60)
-            result = evaluate(hourly, four_hour)
-            score = result['score']
-            RUN_RESULTS.append({'symbol': symbol, 'time_utc': datetime.now(timezone.utc).isoformat(),
-                                'bar': result['bar'], 'score': score,
-                                'price': result['price'], 'atr14': result['atr'],
-                                'rsi14': round(result['rsi'], 2),
-                                'high_24h': result['day_high'], 'low_24h': result['day_low'],
-                                'trigger': bool(result['trigger']), 'entries_blocked': blocked})
-            print(f'{symbol} previous 24h high ${result["day_high"]:.5f}; '
-                  f'low ${result["day_low"]:.5f}; '
-                  f'range position {result["range_position"]:.0%}', flush=True)
-            if blocked or score < MIN_SCORE or not result['trigger'] or not result['trend4'] or not result['trend1']:
-                print(f'{symbol}: score {score}/100; no qualified entry; '
-                      f'RSI {result["rsi"]:.1f}; bar {result["bar"]}', flush=True)
+            result = evaluate(api.bars(symbol))
+            latest_by_symbol[symbol.replace("/", "")] = result
+            qualified = (result["score"] >= min_score and result["trigger"] and
+                         result["trend1"] and result["trend4"] and result["macd_ok"])
+            result.update({"symbol": symbol, "qualified": bool(qualified)})
+            results.append(result)
+            LOG.info("%s score=%d RSI=%.1f qualified=%s bar=%s", symbol,
+                     result["score"], result["rsi"], qualified, result["bar"])
+            if qualified:
+                candidates.append(result)
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            error = f"{symbol}: {type(exc).__name__}: {str(exc)[:180]}"
+            LOG.warning("Market skipped: %s", error)
+            errors.append(error)
+            results.append({"symbol": symbol, "error": error})
+    # For safety, managed exits require a persistent state file AND a fresh scan.
+    # If running on ephemeral CI, persist state across runs or use signals-only mode.
+    if execute:
+        for symbol, plan in list(state["managed"].items()):
+            if symbol not in owned:
+                del state["managed"][symbol]
                 continue
-            size = sizing(score, equity, power, result['price'], result['atr'])
-            if not size:
-                print(f'{symbol}: signal but risk/size constraints reject entry', flush=True)
+            if symbol in pending or symbol not in latest_by_symbol:
                 continue
-            candidates.append((score, symbol, result, size))
-            print(f'QUALIFIED {symbol} score {score}/100, allocation ${size["notional"]:.2f}', flush=True)
-        except (requests.RequestException, RuntimeError, ValueError, KeyError, TypeError) as exc:
-            failures.append(f'{symbol}: {type(exc).__name__}: {str(exc)[:220]}')
-            RUN_RESULTS.append({'symbol': symbol, 'error': failures[-1],
-                                'time_utc': datetime.now(timezone.utc).isoformat()})
-            notify(f'MARKET DATA ERROR {failures[-1]}')
-    # Rank every valid candidate; report only the strongest to reduce alert spam.
-    candidates.sort(key=lambda item: (item[0], -item[3]['estimated_loss']), reverse=True)
-    if candidates:
-        score, symbol, result, size = candidates[0]
-        notify(f'TOP PAPER CANDIDATE: {symbol} | score {score}/100 (not win probability)\n'
-               f'1h candle {result["bar"]} | reference ${result["price"]:.6f}\n'
-               f'24h high ${result["day_high"]:.6f} / low ${result["day_low"]:.6f}\n'
-               f'Allocation ${size["notional"]:.2f} | planned risk ${size["estimated_loss"]:.2f}\n'
-               f'Indicative stop ${size["stop"]:.6f} / target ${size["target"]:.6f}\n'
-               f'NO ORDER PLACED; NO AUTOMATED STOP ACTIVE.')
-    else:
-        print('No qualified candidate. No trade recommended.', flush=True)
-    with open('scan_results.json', 'w', encoding='utf-8') as report:
-        json.dump({'generated_utc': datetime.now(timezone.utc).isoformat(),
-                   'signals_only': True, 'equity': equity, 'scanned': len(symbols), 'results': RUN_RESULTS},
-                  report, indent=2)
-    if len(failures) == len(symbols):
-        raise RuntimeError('All market scans failed. Review logs; do not trade.')
-    notify(f'PAPER SCAN finished | {len(symbols)-len(failures)}/{len(symbols)} markets checked')
+            market = latest_by_symbol[symbol]
+            price = market["price"]
+            if price <= plan["stop"] or price >= plan["target"]:
+                qty = as_number(owned[symbol].get("qty_available", owned[symbol].get("qty", 0)))
+                if qty <= 0:
+                    continue
+                side = "STOP" if price <= plan["stop"] else "TARGET"
+                client_id = f"pb-exit-{symbol.lower()}-{int(time.time())}"
+                try:
+                    api.submit_sell(symbol, qty, client_id)
+                    notify(f"PAPER {side} EXIT submitted {symbol} qty={qty:.9f} ref=${price:.6f}")
+                    pending.add(symbol)
+                except requests.RequestException as exc:
+                    notify(f"EXIT SUBMISSION UNCERTAIN {symbol}: {type(exc).__name__}; check Alpaca orders")
+                    pending.add(symbol)
+    candidates.sort(key=lambda r: (r["score"], r["volume_ok"]), reverse=True)
+    for item in candidates[:5]:
+        price, distance = item["price"], 1.5 * item["atr"]
+        if distance <= 0 or distance >= price:
+            continue
+        risk_dollars = equity * risk_pct / 100
+        notional = min(max_trade, buying_power * 0.95, equity * 0.25,
+                       risk_dollars * price / distance)
+        if notional < 1.05:
+            continue
+        stop, target = price - distance, price + 2 * distance
+        notify(f"CANDIDATE {item['symbol']} score={item['score']}/100 RSI={item['rsi']} "
+               f"ref=${price:.6f} size=${notional:.2f} stop=${stop:.6f} target=${target:.6f}")
+        normalized = item["symbol"].replace("/", "")
+        if not execute or daily_block or normalized in owned or normalized in pending:
+            continue
+        if len(owned) + len(pending) >= max_positions:
+            continue
+        # One entry per completed bar; requires durable state across invocations.
+        last_bar = state.get("last_entry_bar", {}).get(normalized)
+        if last_bar == item["bar"]:
+            continue
+        # Persist intent BEFORE submission, to reduce repeat entries on restart/timeouts.
+        state.setdefault("last_entry_bar", {})[normalized] = item["bar"]
+        save_json(STATE_PATH, state)
+        client_id = f"pb-entry-{normalized.lower()}-{int(time.time())}"
+        try:
+            api.submit_buy(item["symbol"], notional, client_id)
+            state["managed"][normalized] = {"stop": stop, "target": target,
+                                             "entry_reference": price, "client_id": client_id}
+            save_json(STATE_PATH, state)
+            notify(f"PAPER BUY submitted {item['symbol']} ${notional:.2f}; "
+                   "stop/target SOFTWARE-MONITORED, not broker orders")
+            pending.add(normalized)
+        except requests.RequestException as exc:
+            notify(f"BUY SUBMISSION UNCERTAIN {item['symbol']}: {type(exc).__name__}; "
+                   "inspect Alpaca before retrying")
+            pending.add(normalized)
+    report = {"generated_utc": datetime.now(timezone.utc).isoformat(),
+              "paper_orders_enabled": execute, "daily_entries_blocked": daily_block,
+              "equity": equity, "markets": len(symbols), "errors": errors, "results": results}
+    save_json(REPORT_PATH, report)
+    if execute:
+        save_json(STATE_PATH, state)
+    notify(f"PAPER BOT complete | {len(symbols)-len(errors)}/{len(symbols)} scans succeeded | "
+           f"{len(candidates)} candidates | {len(errors)} errors")
+    if len(errors) == len(symbols):
+        raise RuntimeError("Every market scan failed; see scan_results.json")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         main()
     except Exception as exc:
-        notify(f'PAPER BOT FAILED: {type(exc).__name__}: {str(exc)[:250]}')
+        LOG.exception("PAPER BOT FAILED: %s", exc)
         sys.exit(1)
