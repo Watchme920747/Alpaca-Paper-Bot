@@ -10,6 +10,16 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(state["simulations"][0]["status"], "open")
         update_simulations(state, {"BTCUSD":{"bar":"2026-11-22T11:00:00Z","price":111}})
         self.assertEqual(state["simulations"][0]["status"], "closed")
+        self.assertAlmostEqual(state["simulations"][0]["return_pct"], 10.7)
+        self.assertAlmostEqual(state["simulations"][0]["pnl_usd"], 1.07)
+
+    def test_repeated_candle_does_not_advance_trade(self):
+        state = {"simulations": [{"symbol":"BTCUSD","entry_bar":"2026-11-22T10:00:00Z",
+            "entry_price":100,"stop":90,"target":120,"status":"open","bars_held":0}]}
+        candle = {"BTCUSD":{"bar":"2026-11-22T11:00:00Z","price":101}}
+        update_simulations(state, candle)
+        update_simulations(state, candle)
+        self.assertEqual(state["simulations"][0]["bars_held"], 1)
 
     def test_backtest_insufficient_history(self):
         self.assertEqual(backtest([])["trades"], 0)
