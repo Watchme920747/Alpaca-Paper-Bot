@@ -392,9 +392,21 @@ def main():
             "notional_usd": stats["paper_allocation_cap"],
             "initial_risk": distance, "peak_price": item["price"]})
     state["simulations"] = state["simulations"][-500:]
-    notify(f"SHADOW TEST | closed={stats['closed']} recent_win_rate="
-           f"{stats['win_rate']:.0%} avg_return={stats['avg_return_pct']:.3f}% "
-           f"paper_cap=${stats['paper_allocation_cap']:.2f}")
+    open_sims = [s for s in state["simulations"] if s.get("status") == "open"]
+    recent_exits = sorted(
+        (s for s in state["simulations"] if s.get("status") == "closed"),
+        key=lambda s: s.get("exit_bar", ""), reverse=True)[:5]
+    notify(f"SHADOW PAPER | open={len(open_sims)} closed={stats['closed']} "
+           f"win_rate={stats['win_rate']:.0%} avg_net={stats['avg_return_pct']:.3f}% "
+           f"net_PnL=${stats['total_simulated_pnl_usd']:.4f} "
+           f"next_size_cap=${stats['paper_allocation_cap']:.2f}")
+    for s in open_sims[:5]:
+        notify(f"SIM OPEN {s['symbol']} entry=${s['entry_price']:.6f} "
+               f"stop=${s['stop']:.6f} target=${s['target']:.6f}")
+    for s in recent_exits[:3]:
+        notify(f"SIM CLOSED {s['symbol']} entry=${s['entry_price']:.6f} "
+               f"exit=${s['exit_price']:.6f} net={s['return_pct']:+.3f}% "
+               f"PnL=${s.get('pnl_usd', 0):+.4f}")
     # For safety, managed exits require a persistent state file AND a fresh scan.
     # If running on ephemeral CI, persist state across runs or use signals-only mode.
     if execute:
@@ -467,7 +479,8 @@ def main():
         notify("NO QUALIFIED SETUPS | Top near misses: " + (summary or "none"))
     report = {"generated_utc": datetime.now(timezone.utc).isoformat(),
               "paper_orders_enabled": execute, "daily_entries_blocked": daily_block,
-              "equity": equity, "markets": len(symbols), "performance": stats, "errors": errors, "results": results}
+              "equity": equity, "markets": len(symbols), "performance": stats, "open_simulations": open_sims,
+              "recent_simulated_exits": recent_exits, "errors": errors, "results": results}
     save_json(REPORT_PATH, report)
     save_json(STATE_PATH, state)
     notify(f"PAPER BOT complete | {len(symbols)-len(errors)}/{len(symbols)} scans succeeded | "
