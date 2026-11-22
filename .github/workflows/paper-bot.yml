@@ -1,25 +1,57 @@
+
 name: Alpaca paper bot
+
 on:
   workflow_dispatch:
   schedule:
     - cron: '7,22,37,52 * * * *'
+
 permissions:
   contents: read
+
+concurrency:
+  group: alpaca-paper-bot
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -r requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Run PAPER bot
         env:
           ALPACA_PAPER_KEY: ${{ secrets.ALPACA_PAPER_KEY }}
           ALPACA_PAPER_SECRET: ${{ secrets.ALPACA_PAPER_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ENABLE_ORDERS: ${{ vars.ENABLE_ORDERS || 'false' }}
+          ENABLE_ORDERS: 'false'
+          ENABLE_PAPER_ORDERS: 'false'
+          SCAN_ALL_CRYPTO: 'true'
+          MAX_MARKETS: '40'
+          MAX_TRADE_USD: '25'
+          MIN_CONFIDENCE_SCORE: '75'
+          MAX_DAILY_LOSS_PCT: '2'
         run: python bot.py
+
+      - name: Save scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ github.run_id }}
+          path: scan_results.json
+          if-no-files-found: ignore
+          retention-days: 7
