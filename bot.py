@@ -272,12 +272,16 @@ def update_simulations(state, latest, max_bars=12):
         market = latest.get(sim["symbol"])
         if not market or market["bar"] <= sim["entry_bar"]:
             continue
+        if market["bar"] <= sim.get("last_evaluated_bar", sim["entry_bar"]):
+            continue
+        sim["last_evaluated_bar"] = market["bar"]
         sim["bars_held"] = sim.get("bars_held", 0) + 1
         price = market["price"]
         if price <= sim["stop"] or price >= sim["target"] or sim["bars_held"] >= max_bars:
             # Conservative close-based evaluation; actual intrabar stops may differ.
             sim["exit_price"] = price
-            sim["return_pct"] = round(100 * (price / sim["entry_price"] - 1), 4)
+            sim["return_pct"] = round(100 * (price / sim["entry_price"] - 1) - 0.30, 4)
+            sim["pnl_usd"] = round(sim.get("notional_usd", 10.0) * sim["return_pct"] / 100, 4)
             sim["status"] = "closed"
             sim["exit_bar"] = market["bar"]
     state["simulations"] = sims[-500:]
@@ -295,7 +299,8 @@ def performance(state):
     allocation = 25.0 if proven else (5.0 if degraded else 10.0)
     return {"closed": len(closed), "recent": len(recent), "wins": wins,
             "win_rate": round(win_rate, 4), "avg_return_pct": round(avg_return, 4),
-            "paper_allocation_cap": allocation}
+            "paper_allocation_cap": allocation,
+            "total_simulated_pnl_usd": round(sum(s.get("pnl_usd", 0) for s in closed), 4)}
 
 
 def main():
@@ -376,7 +381,8 @@ def main():
         state["simulations"].append({
             "symbol": symbol, "entry_bar": item["bar"], "entry_price": item["price"],
             "stop": item["price"] - distance, "target": item["price"] + 2 * distance,
-            "status": "open", "bars_held": 0, "score": item["score"]})
+            "status": "open", "bars_held": 0, "score": item["score"],
+            "notional_usd": stats["paper_allocation_cap"]})
     state["simulations"] = state["simulations"][-500:]
     notify(f"SHADOW TEST | closed={stats['closed']} recent_win_rate="
            f"{stats['win_rate']:.0%} avg_return={stats['avg_return_pct']:.3f}% "
