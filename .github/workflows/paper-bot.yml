@@ -32,6 +32,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Test simulation logic
+        run: python -m unittest test_simulations.py
+
       - name: Restore simulation history
         uses: actions/cache/restore@v4
         with:
