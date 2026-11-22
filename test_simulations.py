@@ -21,6 +21,17 @@ class SimulationTests(unittest.TestCase):
         update_simulations(state, candle)
         self.assertEqual(state["simulations"][0]["bars_held"], 1)
 
+    def test_trailing_stop_only_tightens(self):
+        state = {"simulations": [{"symbol":"BTCUSD","entry_bar":"2026-11-22T10:00:00Z",
+            "entry_price":100,"stop":95,"target":130,"initial_risk":5,
+            "status":"open","bars_held":0}]}
+        update_simulations(state, {"BTCUSD":{"bar":"2026-11-22T11:00:00Z","price":106}})
+        self.assertEqual(state["simulations"][0]["stop"], 100)
+        update_simulations(state, {"BTCUSD":{"bar":"2026-11-22T12:00:00Z","price":108}})
+        self.assertEqual(state["simulations"][0]["stop"], 100)
+        update_simulations(state, {"BTCUSD":{"bar":"2026-11-22T13:00:00Z","price":111}})
+        self.assertEqual(state["simulations"][0]["stop"], 106)
+
     def test_backtest_insufficient_history(self):
         self.assertEqual(backtest([])["trades"], 0)
 
