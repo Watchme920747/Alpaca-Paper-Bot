@@ -263,6 +263,41 @@ def position_symbol(item):
     return str(item.get("symbol", "")).replace("/", "").upper()
 
 
+def update_simulations(state, latest, max_bars=12):
+    """Evaluate paperless shadow entries only on later completed bars."""
+    sims = state.setdefault("simulations", [])
+    for sim in sims:
+        if sim.get("status") != "open":
+            continue
+        market = latest.get(sim["symbol"])
+        if not market or market["bar"] <= sim["entry_bar"]:
+            continue
+        sim["bars_held"] = sim.get("bars_held", 0) + 1
+        price = market["price"]
+        if price <= sim["stop"] or price >= sim["target"] or sim["bars_held"] >= max_bars:
+            # Conservative close-based evaluation; actual intrabar stops may differ.
+            sim["exit_price"] = price
+            sim["return_pct"] = round(100 * (price / sim["entry_price"] - 1), 4)
+            sim["status"] = "closed"
+            sim["exit_bar"] = market["bar"]
+    state["simulations"] = sims[-500:]
+
+
+def performance(state):
+    closed = [s for s in state.get("simulations", []) if s.get("status") == "closed"]
+    recent = closed[-30:]
+    wins = sum(s["return_pct"] > 0 for s in recent)
+    win_rate = wins / len(recent) if recent else 0
+    avg_return = sum(s["return_pct"] for s in recent) / len(recent) if recent else 0
+    # Never increase size from scan counts, and require enough resolved trades.
+    proven = len(recent) >= 20 and win_rate >= 0.60 and avg_return > 0
+    degraded = len(recent) >= 10 and (win_rate < 0.45 or avg_return <= 0)
+    allocation = 25.0 if proven else (5.0 if degraded else 10.0)
+    return {"closed": len(closed), "recent": len(recent), "wins": wins,
+            "win_rate": round(win_rate, 4), "avg_return_pct": round(avg_return, 4),
+            "paper_allocation_cap": allocation}
+
+
 def main():
     execute = os.getenv("ENABLE_PAPER_ORDERS", "false").lower() == "true"
     max_markets = env_int("MAX_MARKETS", 20, 3, 100)
@@ -322,6 +357,30 @@ def main():
             LOG.warning("Market skipped: %s", error)
             errors.append(error)
             results.append({"symbol": symbol, "error": error})
+    update_simulations(state, latest_by_symbol)
+    stats = performance(state)
+    # Shadow-test promising signals, including near misses, before allocating paper capital.
+    for item in sorted((r for r in results if "error" not in r),
+                       key=lambda r: r["score"], reverse=True)[:5]:
+        if item["score"] < 55 or not item["trend1"] or not item["macd_ok"]:
+            continue
+        symbol = item["symbol"].replace("/", "")
+        active = any(s.get("status") == "open" and s["symbol"] == symbol
+                     for s in state["simulations"])
+        if active or any(s["symbol"] == symbol and s["entry_bar"] == item["bar"]
+                         for s in state["simulations"]):
+            continue
+        distance = 1.5 * item["atr"]
+        if distance <= 0 or distance >= item["price"]:
+            continue
+        state["simulations"].append({
+            "symbol": symbol, "entry_bar": item["bar"], "entry_price": item["price"],
+            "stop": item["price"] - distance, "target": item["price"] + 2 * distance,
+            "status": "open", "bars_held": 0, "score": item["score"]})
+    state["simulations"] = state["simulations"][-500:]
+    notify(f"SHADOW TEST | closed={stats['closed']} recent_win_rate="
+           f"{stats['win_rate']:.0%} avg_return={stats['avg_return_pct']:.3f}% "
+           f"paper_cap=${stats['paper_allocation_cap']:.2f}")
     # For safety, managed exits require a persistent state file AND a fresh scan.
     # If running on ephemeral CI, persist state across runs or use signals-only mode.
     if execute:
@@ -352,7 +411,7 @@ def main():
         if distance <= 0 or distance >= price:
             continue
         risk_dollars = equity * risk_pct / 100
-        notional = min(max_trade, buying_power * 0.95, equity * 0.25,
+        notional = min(max_trade, stats["paper_allocation_cap"], buying_power * 0.95, equity * 0.25,
                        risk_dollars * price / distance)
         if notional < 1.05:
             continue
@@ -394,10 +453,9 @@ def main():
         notify("NO QUALIFIED SETUPS | Top near misses: " + (summary or "none"))
     report = {"generated_utc": datetime.now(timezone.utc).isoformat(),
               "paper_orders_enabled": execute, "daily_entries_blocked": daily_block,
-              "equity": equity, "markets": len(symbols), "errors": errors, "results": results}
+              "equity": equity, "markets": len(symbols), "performance": stats, "errors": errors, "results": results}
     save_json(REPORT_PATH, report)
-    if execute:
-        save_json(STATE_PATH, state)
+    save_json(STATE_PATH, state)
     notify(f"PAPER BOT complete | {len(symbols)-len(errors)}/{len(symbols)} scans succeeded | "
            f"{len(candidates)} candidates | {len(errors)} errors")
     if len(errors) == len(symbols):
