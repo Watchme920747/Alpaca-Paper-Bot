@@ -485,6 +485,38 @@ def main():
     save_json(STATE_PATH, state)
     notify(f"PAPER BOT complete | {len(symbols)-len(errors)}/{len(symbols)} scans succeeded | "
            f"{len(candidates)} candidates | {len(errors)} errors")
+    # Additional human-readable summary, appended AFTER all existing alerts.
+    # This section is informational and does not authorize or submit orders.
+    lines = [
+        "📋 EASY-READ PAPER BOT UPDATE",
+        f"Mode: {'PAPER ORDERS' if execute else 'SIGNALS ONLY'} (Alpaca paper account)",
+        f"Scan: {len(symbols)-len(errors)}/{len(symbols)} markets OK | {len(errors)} errors",
+        f"Direction: {'BULLISH SETUP(S)' if candidates else 'NO CONFIRMED BULLISH ENTRY'}",
+        f"New entries: {'BLOCKED — daily loss limit' if daily_block else ('PAPER MODE PERMITTED' if execute else 'DISABLED — alerts only')}",
+        f"Qualified setups: {len(candidates)} | Open hypothetical trades: {len(open_sims)}",
+        f"Hypothetical P&L: ${stats['total_simulated_pnl_usd']:+.4f} (NOT broker P&L)",
+    ]
+    if candidates:
+        for item in candidates[:3]:
+            distance = 1.5 * item["atr"]
+            lines.append(
+                f"🟢 WATCH {item['symbol']} | score {item['score']}/100 | "
+                f"reference ${item['price']:.6f} | stop ${item['price']-distance:.6f} | "
+                f"target ${item['price']+2*distance:.6f}"
+            )
+    elif near_misses:
+        for item in near_misses[:3]:
+            reasons = ", ".join(item["rejection_reasons"][:3])
+            lines.append(f"🟡 WAIT {item['symbol']} | score {item['score']}/100 | missing: {reasons}")
+    else:
+        lines.append("⚪ WAIT | No usable entry signals; check scan errors.")
+    lines += [
+        "Risk: software-managed stops are NOT guaranteed broker stops.",
+        "Railway read-only monitor health: NOT VERIFIED BY THIS BOT.",
+        "No prediction is guaranteed. Hypothetical results are not real profits.",
+    ]
+    notify("\\n".join(lines))
+
     if len(errors) == len(symbols):
         raise RuntimeError("Every market scan failed; see scan_results.json")
 
