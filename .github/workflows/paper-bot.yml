@@ -37,6 +37,11 @@ jobs:
       - name: Test simulation logic
         run: python -m unittest test_simulations.py
 
+      - name: Verify easy-read alert code compiles
+        run: |
+          python -m py_compile bot.py
+          python -c "from pathlib import Path; assert 'EASY-READ PAPER BOT UPDATE' in Path('bot.py').read_text()"
+
       - name: Restore simulation history
         uses: actions/cache/restore@v4
         with:
