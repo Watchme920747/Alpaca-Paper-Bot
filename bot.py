@@ -515,7 +515,7 @@ def main():
         "Railway read-only monitor health: NOT VERIFIED BY THIS BOT.",
         "No prediction is guaranteed. Hypothetical results are not real profits.",
     ]
-    notify("\\n".join(lines))
+    notify("\n".join(lines))
 
     if len(errors) == len(symbols):
         raise RuntimeError("Every market scan failed; see scan_results.json")
